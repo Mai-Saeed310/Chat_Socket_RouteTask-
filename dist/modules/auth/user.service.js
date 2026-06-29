@@ -1,0 +1,398 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const user_enum_1 = require("./../../common/enum/user.enum");
+const global_error_handling_1 = require("../../common/utiliti/global-error-handling");
+const user_repository_1 = require("../../DB/Repository/user.repository");
+const encrypt_security_1 = require("../../common/utiliti/security/encrypt.security");
+const hash_security_1 = require("../../common/utiliti/security/hash.security");
+const send_email_1 = require("../../common/utiliti/email/send.email");
+const email_template_1 = require("../../common/utiliti/email/email.template");
+const node_crypto_1 = require("node:crypto");
+const config_service_1 = require("../../config/config.service");
+const user_enum_2 = require("../../common/enum/user.enum");
+const redis_service_1 = require("../../DB/redis.service");
+const google_auth_library_1 = require("google-auth-library");
+const email_events_1 = require("../../common/utiliti/email/email.events");
+const event_enum_1 = require("../../common/enum/event.enum");
+const radis_service_1 = __importDefault(require("../../common/service/radis.service"));
+const token_1 = __importDefault(require("../../common/middlware/token"));
+const S3_service_1 = require("../../common/service/S3.service");
+const promises_1 = require("node:stream/promises");
+const chat_repository_1 = require("../../DB/Repository/chat.repository");
+class UserService {
+    _userModel = new user_repository_1.UserRepository();
+    _chatModel = new chat_repository_1.ChatRepository();
+    _radisService = radis_service_1.default;
+    _tokenService = token_1.default;
+    _S3Service = new S3_service_1.S3Service();
+    constructor() { }
+    signUp = async (req, res, next) => {
+        const { userName, email, password, age, gender, address, phone } = req.body;
+        const UserExist = await this._userModel.findOne({ filter: { email } });
+        if (UserExist) {
+            throw new global_error_handling_1.AppError("User already exist", 409);
+        }
+        const user = await this._userModel.create({
+            userName,
+            email,
+            password: password,
+            age,
+            gender,
+            address,
+            phone: phone ? (0, encrypt_security_1.encrypt)(phone) : null
+        });
+        const otp = await (0, send_email_1.generateOtp)();
+        email_events_1.eventEmitter.emit(event_enum_1.EventEnum.confirmEmail, async () => {
+            await (0, send_email_1.sendEmail)({ to: email, subject: "Email confirmation", html: (0, email_template_1.emailTemplate)(otp) });
+            await this._radisService.setValue({ key: this._radisService.otp_key({ email: email, subject: event_enum_1.EventEnum.confirmEmail }), value: (0, hash_security_1.Hash)({ plainText: `${otp}` }), ttl: 60 * 2 });
+            await this._radisService.setValue({ key: this._radisService.max_otp_key(email), value: 1, ttl: 60 * 10 });
+        });
+        res.status(201).json({ message: "done", data: user });
+    };
+    signIn = async (req, res, next) => {
+        const { email, password } = req.body;
+        const user = await this._userModel.findOne({ filter: { email, confirmed: { $exists: true }, provider: user_enum_2.providerEnum.System } });
+        if (!user) {
+            throw new global_error_handling_1.AppError("User does not found", 404);
+        }
+        const isBlocked = await this._radisService.ttl(this._radisService.block_login_key(email));
+        if (isBlocked > 0) {
+            throw new global_error_handling_1.AppError(`Your account is blocked, try again after ${isBlocked} seconds`, 400);
+        }
+        if (!(0, hash_security_1.Compare)({ plainText: password, cipherText: user.password })) {
+            const attempts_key = this._radisService.login_attempts_key(email);
+            const attempts = await this._radisService.incr(attempts_key);
+            await this._radisService.expire({ key: attempts_key, ttl: 60 * 10 });
+            if (attempts >= 5) {
+                await this._radisService.setValue({
+                    key: this._radisService.block_login_key(email),
+                    value: 1,
+                    ttl: 60 * 5
+                });
+                await this._radisService.deleteKey(this._radisService.login_attempts_key(email));
+                throw new global_error_handling_1.AppError("Account blocked for 5 minutes", 400);
+            }
+            throw new global_error_handling_1.AppError("inValid password", 400);
+        }
+        await this._radisService.deleteKey(this._radisService.login_attempts_key(email));
+        const jwtId = (0, node_crypto_1.randomUUID)();
+        const access_token = this._tokenService.GenerateToken({
+            payload: { id: user._id },
+            secret_key: user?.role == user_enum_1.RoleEnum.user ? config_service_1.ACCESS_SECRET_KEY_USER : config_service_1.ACCESS_SECRET_KEY_ADMIN,
+            options: {
+                expiresIn: "1h",
+                jwtid: jwtId
+            }
+        });
+        const refresh_token = this._tokenService.GenerateToken({
+            payload: { id: user._id },
+            secret_key: user?.role == user_enum_1.RoleEnum.user ? config_service_1.REFRESH_SECRET_KEY_USER : config_service_1.REFRESH_SECRET_KEY_ADMIN,
+            options: {
+                expiresIn: "1y",
+                jwtid: jwtId
+            }
+        });
+        return res.status(200).json({
+            message: "Done",
+            data: {
+                access_token: access_token,
+                refresh_token: refresh_token
+            }
+        });
+    };
+    confirmEmail = async (req, res, next) => {
+        const { email, otp } = req.body;
+        const otpValue = await this._radisService.get(this._radisService.otp_key({ email, subject: event_enum_1.EventEnum.confirmEmail }));
+        if (!otpValue) {
+            throw new global_error_handling_1.AppError("otp expired", 400);
+        }
+        if (!(0, hash_security_1.Compare)({ plainText: otp, cipherText: otpValue })) {
+            throw new global_error_handling_1.AppError("inValid otp", 400);
+        }
+        const user = await this._userModel.findOneAndUpdate({
+            filter: { email, confirmed: { $exists: false }, provider: user_enum_2.providerEnum.System },
+            update: { confirmed: true }
+        });
+        if (!user) {
+            throw new global_error_handling_1.AppError("user not exist", 400);
+        }
+        await this._radisService.deleteKey(this._radisService.otp_key({ email, subject: event_enum_1.EventEnum.confirmEmail }));
+        res.status(201).json({ message: "email confirmed successfully" });
+    };
+    getProfile = async (req, res, next) => {
+        const user = await this._userModel.findOne({
+            filter: { _id: req.user?._id },
+            options: {
+                populate: [
+                    {
+                        path: "friends"
+                    }
+                ]
+            }
+        });
+        const groups = await this._chatModel.find({
+            filter: {
+                participants: {
+                    $in: [req.user?._id]
+                },
+                group: { $exists: true }
+            },
+        });
+        return res.status(200).json({
+            message: "done",
+            data: user,
+            groups
+        });
+    };
+    forgetPassword = async (req, res, next) => {
+        const { email } = req.body;
+        const user = await this._userModel.findOne({ filter: { email, confirmed: { $exists: true } } });
+        if (!user) {
+            throw new global_error_handling_1.AppError("user not exist or not confirmed", 404);
+        }
+        const otp = await (0, send_email_1.generateOtp)();
+        await (0, send_email_1.sendEmail)({ to: email, subject: "Forget password", html: (0, email_template_1.emailTemplate)(otp) });
+        await this._radisService.setValue({
+            key: this._radisService.otp_key({ email, subject: event_enum_1.EventEnum.forgetPassword }),
+            value: (0, hash_security_1.Hash)({ plainText: `${otp}` }),
+            ttl: 60 * 2
+        });
+        res.status(200).json({ message: "OTP send it to the email" });
+    };
+    resetPasswordOtp = async (req, res, next) => {
+        const { email, otp, newPassword } = req.body;
+        const storedOtp = await this._radisService.get(this._radisService.otp_key({ email, subject: event_enum_1.EventEnum.forgetPassword }));
+        if (!storedOtp) {
+            throw new global_error_handling_1.AppError("OTP expired", 400);
+        }
+        if (!(0, hash_security_1.Compare)({ plainText: otp, cipherText: storedOtp })) {
+            throw new global_error_handling_1.AppError("Invalid OTP", 400);
+        }
+        const user = await this._userModel.findOne({ filter: { email } });
+        if (!user) {
+            throw new global_error_handling_1.AppError("user not exist or not confirmed", 404);
+        }
+        user.password = newPassword;
+        user.changeCredential = new Date();
+        await user.save();
+        await this._radisService.deleteKey(this._radisService.otp_key({ email, subject: event_enum_1.EventEnum.forgetPassword }));
+        return res.status(200).json({
+            message: "Password reset successfully",
+        });
+    };
+    updatePassword = async (req, res, next) => {
+        const { oldPassword, newPassword } = req.body;
+        const user = req.user;
+        if (!(0, hash_security_1.Compare)({ plainText: oldPassword, cipherText: user.password })) {
+            throw new global_error_handling_1.AppError("invalid old password", 400);
+        }
+        user.password = newPassword;
+        user.changeCredential = new Date();
+        await user.save();
+        return res.status(200).json({
+            message: "password updated successfully",
+        });
+    };
+    logOut = async (req, res, next) => {
+        const { flag } = req.body;
+        if (flag.toLowerCase() === "all") {
+            req.user.changeCredential = new Date();
+            await req.user.save();
+            const userKeys = await this._radisService.keys(this._radisService.get_key({ userId: req.user._id }));
+            if (userKeys.length) {
+                await redis_service_1.redisClient.del(userKeys);
+            }
+        }
+        else {
+            await this._radisService.setValue({
+                key: this._radisService.revoke_key({ userId: req.user._id, jti: req.decoded.jti }),
+                value: `${req.decoded.jti}`,
+                ttl: req.decoded.exp - Math.floor(Date.now() / 1000)
+            });
+        }
+        return res.status(200).json({ message: "Done." });
+    };
+    signUpWithGmail = async (req, res, next) => {
+        const { idToken } = req.body;
+        const client = new google_auth_library_1.OAuth2Client();
+        const ticket = await client.verifyIdToken({
+            idToken,
+            audience: config_service_1.CLIENT_ID,
+        });
+        const payload = ticket.getPayload();
+        console.log(payload);
+        const { email, email_verified, name } = payload;
+        if (!email || !email_verified) {
+            throw new global_error_handling_1.AppError("Invalid Google account", 400);
+        }
+        let user = await this._userModel.findOne({
+            filter: { email }
+        });
+        if (!user) {
+            const parts = name?.split(" ") || [];
+            const firstName = parts[0] || "User";
+            const lastName = parts.slice(1).join(" ") || "User";
+            user = await this._userModel.create({
+                email,
+                confirmed: email_verified,
+                firstName,
+                lastName,
+                provider: user_enum_2.providerEnum.Google
+            });
+        }
+        if (user.provider === user_enum_2.providerEnum.System) {
+            throw new global_error_handling_1.AppError("please log in on system only", 400);
+        }
+        const access_token = this._tokenService.GenerateToken({
+            payload: {
+                id: user._id,
+                email: user.email
+            },
+            secret_key: user?.role == user_enum_1.RoleEnum.user ? config_service_1.ACCESS_SECRET_KEY_USER : config_service_1.ACCESS_SECRET_KEY_ADMIN,
+            options: {
+                expiresIn: "1d",
+            }
+        });
+        return res.status(200).json({
+            message: "done",
+            access_token,
+            user
+        });
+    };
+    resendOtp = async (req, res, next) => {
+        const { email } = req.body;
+        const user = await this._userModel.findOne({
+            filter: { email, confirmed: { $exists: false }, provider: user_enum_2.providerEnum.System },
+        });
+        if (!user) {
+            throw new global_error_handling_1.AppError("user not exist or already confirmed");
+        }
+        await this.sendEmailOtp({ email, subject: event_enum_1.EventEnum.confirmEmail });
+        res.status(201).json({ message: "done" });
+    };
+    sendEmailOtp = async ({ email, subject }) => {
+        const isBlocked = await this._radisService.ttl(this._radisService.block_otp_key(email));
+        if (isBlocked > 0) {
+            throw new global_error_handling_1.AppError(`you blocked please try again after ${isBlocked} seconds`);
+        }
+        const key = this._radisService.otp_key({ email, subject });
+        const ttlOtp = await this._radisService.ttl(key);
+        if (ttlOtp > 0) {
+            throw new global_error_handling_1.AppError(`you already have otp not expired yet please try again after ${ttlOtp} seconds`);
+        }
+        if ((await this._radisService.get(this._radisService.max_otp_key(email))) >= 3) {
+            await this._radisService.setValue({
+                key: this._radisService.block_otp_key(email),
+                value: 1,
+                ttl: 15 * 60,
+            });
+            throw new global_error_handling_1.AppError(`you exceed maximum number of trials`);
+        }
+        const otp = await (0, send_email_1.generateOtp)();
+        email_events_1.eventEmitter.emit(event_enum_1.EventEnum.confirmEmail, async () => {
+            await (0, send_email_1.sendEmail)({
+                to: email,
+                subject,
+                html: (0, email_template_1.emailTemplate)(otp)
+            });
+            await this._radisService.setValue({
+                key,
+                value: (0, hash_security_1.Hash)({ plainText: `${otp}` }),
+                ttl: 60 * 2,
+            });
+            await this._radisService.incr(this._radisService.max_otp_key(email));
+        });
+    };
+    uploadFile = async (req, res, next) => {
+        const key = await this._S3Service.uploadFile({
+            file: req.file,
+            path: "users"
+        });
+        return res.status(200).json({ message: "done", key });
+    };
+    uploadLargeFile = async (req, res, next) => {
+        const key = await this._S3Service.uploadLargeFile({
+            file: req.file,
+            path: "users/large"
+        });
+        return res.status(200).json({ message: "done", key });
+    };
+    uploadFiles = async (req, res, next) => {
+        const urls = await this._S3Service.uploadFiles({
+            files: req.files,
+            path: "users/files"
+        });
+        return res.status(200).json({ message: "done", urls: urls });
+    };
+    uploadUrl = async (req, res, next) => {
+        const { ContentType, fileName } = req.body;
+        const { url, Key } = await this._S3Service.createPreSignedUrl({
+            fileName,
+            ContentType,
+            path: "users",
+        });
+        if (!req.user?._id) {
+            throw new global_error_handling_1.AppError("User not found", 404);
+        }
+        const updatedUser = await this._userModel.findOneAndUpdate({
+            filter: { _id: req.user._id },
+            update: { profilePic: Key }
+        });
+        return res.status(200).json({ message: "done", data: { Key, url } });
+    };
+    getFile = (async (req, res, next) => {
+        const { path } = req.params;
+        const { download } = req.query;
+        const Key = path.join("/");
+        const result = await this._S3Service.getFile(Key);
+        const stream = result.Body;
+        res.setHeader("Content-Type", result.ContentType);
+        res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+        if (download && download === "true") {
+            res.setHeader("Content-Disposition", `attachment; filename="${path.pop()}"`);
+        }
+        await (0, promises_1.pipeline)(stream, res);
+    });
+    getFiles = (async (req, res, next) => {
+        const { folderName } = req.query;
+        const result = await this._S3Service.getFiles(folderName);
+        return res.status(200).json({ message: "done", data: result });
+    });
+    getPreSigned = (async (req, res, next) => {
+        const { path } = req.params;
+        const { download } = req.query;
+        const Key = path.join("/");
+        const url = await this._S3Service.getPreSignedUrl({ Key, download: download ? download : undefined });
+        return res.status(200).json({ message: "done", URL: url });
+    });
+    deleteFile = (async (req, res, next) => {
+        const { Key } = req.query;
+        if (!Key) {
+            throw new global_error_handling_1.AppError("Key is required", 400);
+        }
+        let result = await this._S3Service.deleteFile(Key);
+        return res.status(200).json({ message: "done" });
+    });
+    deleteFiles = (async (req, res, next) => {
+        const { Keys } = req.body;
+        console.log({ Keys });
+        let result = await this._S3Service.deleteFiles(Keys);
+        return res.status(200).json({ message: "done", result: result });
+    });
+    deleteFolder = (async (req, res, next) => {
+        const { folderName } = req.body;
+        let result = await new S3_service_1.S3Service().deleteFolder(folderName);
+        return res.status(200).json({ message: "done", data: result });
+    });
+    getUser = async (parent, args) => {
+        return await this._userModel.findOne({ filter: { _id: args._id } });
+    };
+    getUsers = async () => {
+        return await this._userModel.find({ filter: {} });
+    };
+}
+;
+exports.default = new UserService();
